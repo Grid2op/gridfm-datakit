@@ -99,3 +99,36 @@ def test_batch_refuses_anything_but_outages():
     converted = l2g.update_lightsim2grid(net)
     with pytest.raises(l2g.BatchNotSupported):
         l2g.run_ls_pf_batch(converted, net, [changed], False)
+
+
+@pytest.mark.parametrize("include_dc_res", [True, False])
+def test_batch_post_processing_matches_per_perturbation(include_dc_res):
+    from gridfm_datakit.process.process_network import (
+        pf_post_processing,
+        pf_post_processing_batch,
+    )
+
+    net = _load_net()
+    np.random.seed(1)
+    perturbations = list(
+        RandomComponentDropGenerator(25, 3, net, ["branch", "gen"]).generate(net),
+    )
+    converted = l2g.update_lightsim2grid(net)
+    sol = l2g.solve_ls_pf_batch(converted, net, perturbations, include_dc_res)
+    batched = pf_post_processing_batch(7, net, perturbations, sol, include_dc_res)
+    assert len(batched) == len(perturbations)
+    for k, p in enumerate(perturbations):
+        res_ac, res_dc = sol.row_result(k)
+        if res_ac is None:
+            assert batched[k] is None
+            continue
+        expected = pf_post_processing(7, p, res_ac, res_dc, include_dc_res)
+        for got, name in zip(batched[k], ("bus", "gen", "branch", "Y_bus", "runtime")):
+            np.testing.assert_allclose(
+                got,
+                expected[name],
+                rtol=0,
+                atol=1e-9,
+                equal_nan=True,
+                err_msg=name,
+            )

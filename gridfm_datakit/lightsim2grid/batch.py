@@ -21,6 +21,7 @@ caller can fall back to one power flow per perturbation.
 """
 
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -43,8 +44,13 @@ class BatchNotSupported(Exception):
 _TOL_MISMATCH_MW = 1e-6
 
 
-def _non_status_columns(n_cols: int, status_col: int) -> np.ndarray:
-    return np.array([c for c in range(n_cols) if c != status_col])
+def _equal_except_column(a: np.ndarray, b: np.ndarray, column: int) -> bool:
+    """Whether two matrices are equal except, maybe, in one column (views, no copy)."""
+    return (
+        a.shape == b.shape
+        and np.array_equal(a[:, :column], b[:, :column])
+        and np.array_equal(a[:, column + 1 :], b[:, column + 1 :])
+    )
 
 
 def _check_only_outages(base: Network, perturbations: Sequence[Network]) -> None:
@@ -59,24 +65,13 @@ def _check_only_outages(base: Network, perturbations: Sequence[Network]) -> None
             status of branches and generators (and the bus types that follow from it),
             or switches an element on.
     """
-    br_cols = _non_status_columns(base.branches.shape[1], BR_STATUS)
-    gen_cols = _non_status_columns(base.gens.shape[1], GEN_STATUS)
-    bus_cols = _non_status_columns(base.buses.shape[1], BUS_TYPE)
-    base_br, base_gen, base_bus = (
-        base.branches[:, br_cols],
-        base.gens[:, gen_cols],
-        base.buses[:, bus_cols],
-    )
     base_br_on = base.branches[:, BR_STATUS] > 0
     base_gen_on = base.gens[:, GEN_STATUS] > 0
     for p in perturbations:
         if (
-            p.branches.shape != base.branches.shape
-            or p.gens.shape != base.gens.shape
-            or p.buses.shape != base.buses.shape
-            or not np.array_equal(p.branches[:, br_cols], base_br)
-            or not np.array_equal(p.gens[:, gen_cols], base_gen)
-            or not np.array_equal(p.buses[:, bus_cols], base_bus)
+            not _equal_except_column(p.branches, base.branches, BR_STATUS)
+            or not _equal_except_column(p.gens, base.gens, GEN_STATUS)
+            or not _equal_except_column(p.buses, base.buses, BUS_TYPE)
             or np.any((p.branches[:, BR_STATUS] > 0) & ~base_br_on)
             or np.any((p.gens[:, GEN_STATUS] > 0) & ~base_gen_on)
         ):
@@ -351,18 +346,116 @@ def _gen_results(
     return np.stack([p, q], axis=-1)
 
 
-def run_ls_pf_batch(
+@dataclass
+class BatchSolution:
+    """Stacked results of :func:`solve_ls_pf_batch`, one row per perturbation.
+
+    Arrays are filled for the rows whose power flow converged (``ok_ac`` / ``ok_dc``) and
+    are zero elsewhere. Per unit and radians, like the dict layout of ``get_pf_res``.
+    The bus arrays are indexed by bus index (``BUS_I``).
+
+    Attributes:
+        base_mva: Base power of the network.
+        br_on: ``(rows, n_branches)`` which branches are in service.
+        gen_on: ``(rows, n_gens)`` which generators are in service.
+        ok_ac: ``(rows,)`` the AC power flow converged.
+        vm: ``(rows, n_buses)`` AC voltage magnitude.
+        va: ``(rows, n_buses)`` AC voltage angle.
+        flows: ``(rows, n_branches, 4)`` AC ``pf, qf, pt, qt``.
+        gens: ``(rows, n_gens, 2)`` AC ``pg, qg``.
+        ybus: per row ``(rows, cols, values)`` of the Ybus non-zeros in row-major order.
+        t_ac: AC solving time per row.
+        ok_dc: ``(rows,)`` the DC power flow converged (all False without DC).
+        dc_va: ``(rows, n_buses)`` DC voltage angle.
+        dc_pf: ``(rows, n_branches)`` DC active power at the origin side (the other side is
+            ``-dc_pf``).
+        dc_pg: ``(rows, n_gens)`` DC generator active power.
+        t_dc: DC solving time per row.
+    """
+
+    base_mva: float
+    br_on: np.ndarray
+    gen_on: np.ndarray
+    ok_ac: np.ndarray
+    vm: np.ndarray
+    va: np.ndarray
+    flows: np.ndarray
+    gens: np.ndarray
+    ybus: List[Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]]
+    t_ac: float
+    ok_dc: np.ndarray
+    dc_va: np.ndarray
+    dc_pf: np.ndarray
+    dc_pg: np.ndarray
+    t_dc: float
+
+    def row_result(self, r: int) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """AC and DC results of one row as ``run_ls_pf(..., as_arrays=True)``-like dicts.
+
+        Args:
+            r: The row.
+
+        Returns:
+            The AC and DC results, None for a power flow that did not converge.
+        """
+        res_ac = res_dc = None
+        if self.ok_ac[r]:
+            res_ac = {
+                "solution": {
+                    "baseMVA": self.base_mva,
+                    "per_unit": True,
+                    "pf": True,
+                    "arrays": (
+                        self.flows[r][self.br_on[r]],
+                        self.gens[r][self.gen_on[r]],
+                        np.column_stack((self.vm[r], self.va[r])),
+                    ),
+                    "Ybus": self.ybus[r],
+                },
+                "solve_time": self.t_ac,
+            }
+        if self.ok_dc[r]:
+            zeros = np.zeros(self.dc_pf.shape[1])
+            res_dc = {
+                "solution": {
+                    "baseMVA": self.base_mva,
+                    "per_unit": True,
+                    "pf": True,
+                    "arrays": (
+                        np.column_stack((self.dc_pf[r], zeros, -self.dc_pf[r], zeros))[
+                            self.br_on[r]
+                        ],
+                        np.column_stack((self.dc_pg[r], np.zeros_like(self.dc_pg[r])))[
+                            self.gen_on[r]
+                        ],
+                        np.column_stack((np.ones_like(self.dc_va[r]), self.dc_va[r])),
+                    ),
+                },
+                "solve_time": self.t_dc,
+            }
+        return res_ac, res_dc
+
+    def row_results(
+        self,
+    ) -> Tuple[List[Optional[Dict[str, Any]]], List[Optional[Dict[str, Any]]]]:
+        """The results as one ``run_ls_pf(..., as_arrays=True)``-like dict per row.
+
+        Returns:
+            The AC and DC results, None for the rows that did not converge.
+        """
+        pairs = [self.row_result(r) for r in range(self.br_on.shape[0])]
+        return [a for a, _ in pairs], [d for _, d in pairs]
+
+
+def solve_ls_pf_batch(
     converted: ConvertedNetwork,
     base: Network,
     perturbations: Sequence[Network],
     include_dc: bool,
     max_iter: int = 50,
     tol: float = 1e-8,
-) -> Tuple[List[Optional[Dict[str, Any]]], List[Optional[Dict[str, Any]]]]:
+) -> BatchSolution:
     """Solve the outages of one scenario with one lightsim2grid call per power flow type.
-
-    Results have the layout of ``run_ls_pf(..., as_arrays=True)`` (with the Ybus of the AC
-    result), so that ``pf_post_processing`` takes them unchanged.
 
     Args:
         converted: The LSGrid of ``base``, in sync with it (see ``update_lightsim2grid``).
@@ -374,30 +467,24 @@ def run_ls_pf_batch(
         tol: Convergence tolerance.
 
     Returns:
-        The AC and DC results, one entry per perturbation, None where the power flow did
-        not converge (the DC list is all None if ``include_dc`` is False).
+        The stacked results.
 
     Raises:
         BatchNotSupported: If the batch cannot be solved reliably.
     """
     ls_net, mapping = converted.ls_net, converted.mapping_l2g
     n_rows = len(perturbations)
-    if n_rows == 0:
-        return [], []
     _check_only_outages(base, perturbations)
 
     base_mva = float(base.baseMVA)
     n_buses, nl = base.buses.shape[0], base.branches.shape[0]
+    n_gens = base.gens.shape[0]
     bus_idx = base.buses[:, BUS_I].astype(int)
     bus_row = np.empty(bus_idx.max() + 1, dtype=np.int64)
     bus_row[bus_idx] = np.arange(n_buses)
 
-    br_on = np.stack(
-        [p.branches[:, BR_STATUS] > 0 for p in perturbations]
-    )  # (rows, nl)
-    gen_on = np.stack(
-        [p.gens[:, GEN_STATUS] > 0 for p in perturbations]
-    )  # (rows, n_gens)
+    br_on = np.stack([p.branches[:, BR_STATUS] > 0 for p in perturbations])
+    gen_on = np.stack([p.gens[:, GEN_STATUS] > 0 for p in perturbations])
     base_br_on = base.branches[:, BR_STATUS] > 0
     base_gen_on = base.gens[:, GEN_STATUS] > 0
     masks = (
@@ -408,12 +495,15 @@ def run_ls_pf_batch(
 
     v_init = initial_voltage(base)
     t0 = time.perf_counter()
-    slack_ac = _slack_shares(ls_net, base, v_init, False, max_iter, tol)
-    base_ybus = get_ybus(
-        ls_net, base
-    )  # datakit bus indexing; valid after the AC base case
+    slack_share = _slack_shares(ls_net, base, v_init, False, max_iter, tol)
+    base_ybus = get_ybus(ls_net, base)  # valid after the AC base case
     _, v_ac, ok_ac = _solve_sweep(
-        ls_net, masks, v_init, ("NR_KLU", "NR_SparseLU"), max_iter, tol
+        ls_net,
+        masks,
+        v_init,
+        ("NR_KLU", "NR_SparseLU"),
+        max_iter,
+        tol,
     )
     t_ac = (time.perf_counter() - t0) / n_rows
 
@@ -422,76 +512,129 @@ def run_ls_pf_batch(
     f_row = bus_row[base.branches[:, F_BUS].real.astype(int)]
     t_row = bus_row[base.branches[:, T_BUS].real.astype(int)]
     stat = br_on.astype(float)
+    # bus row -> bus index, to store the results by bus index
+    s_load = (base.buses[:, PD] + 1j * base.buses[:, QD]) / base_mva
+    ysh = (base.buses[:, GS] + 1j * base.buses[:, BS]) / base_mva
 
     rows = np.flatnonzero(ok_ac)
-    V = v_ac[rows]
-    Vf, Vt = V[:, f_row], V[:, t_row]
-    Sf = Vf * np.conj(Yff * Vf + Yft * Vt) * stat[rows]
-    St = Vt * np.conj(Ytf * Vf + Ytt * Vt) * stat[rows]
-    ysh = (base.buses[:, GS] + 1j * base.buses[:, BS]) / base_mva
-    s_inj = V * np.conj(ysh * V)
-    np.add.at(s_inj.T, f_row, Sf.T)
-    np.add.at(s_inj.T, t_row, St.T)
-    s_load = (base.buses[:, PD] + 1j * base.buses[:, QD]) / base_mva
-    s_gen_bus = s_inj + s_load
-    gens = _gen_results(base, gen_on[rows], s_gen_bus, slack_ac, bus_row, with_q=True)
+    vm = np.zeros((n_rows, n_buses))
+    va = np.zeros((n_rows, n_buses))
+    flows = np.zeros((n_rows, nl, 4))
+    gens = np.zeros((n_rows, n_gens, 2))
+    ybus: List[Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = [None] * n_rows
+    if rows.size:
+        V = v_ac[rows]
+        Vf, Vt = V[:, f_row], V[:, t_row]
+        Sf = Vf * np.conj(Yff * Vf + Yft * Vt) * stat[rows]
+        St = Vt * np.conj(Ytf * Vf + Ytt * Vt) * stat[rows]
+        s_inj = V * np.conj(ysh * V)
+        np.add.at(s_inj.T, f_row, Sf.T)
+        np.add.at(s_inj.T, t_row, St.T)
+        gens[rows] = _gen_results(
+            base,
+            gen_on[rows],
+            s_inj + s_load,
+            slack_share,
+            bus_row,
+            with_q=True,
+        )
+        flows[rows] = np.stack((Sf.real, Sf.imag, St.real, St.imag), axis=-1)
+        vm[np.ix_(rows, bus_idx)] = np.abs(V)
+        va[np.ix_(rows, bus_idx)] = np.angle(V)
+        removed = [np.flatnonzero(~br_on[r] & base_br_on) for r in rows]
+        for r, y in zip(
+            rows,
+            _ybus_removal(base_ybus, base, (Ytt, Yff, Yft, Ytf), removed),
+        ):
+            ybus[r] = y
 
-    removed = [np.flatnonzero(~br_on[r] & base_br_on) for r in rows]
-    vecs = (Ytt, Yff, Yft, Ytf)
-    ybus = _ybus_removal(base_ybus, base, vecs, removed)
-
-    res_ac: List[Optional[Dict[str, Any]]] = [None] * n_rows
-    vm, va = np.abs(V), np.angle(V)
-    for k, r in enumerate(rows):
-        bus_vmva = np.empty((n_buses, 2))
-        bus_vmva[bus_idx] = np.column_stack((vm[k], va[k]))
-        flows = np.column_stack((Sf[k].real, Sf[k].imag, St[k].real, St[k].imag))
-        res_ac[r] = {
-            "solution": {
-                "baseMVA": base_mva,
-                "per_unit": True,
-                "pf": True,
-                "arrays": (flows[br_on[r]], gens[k][gen_on[r]], bus_vmva),
-                "Ybus": ybus[k],
-            },
-            "solve_time": t_ac,
-        }
-
-    res_dc: List[Optional[Dict[str, Any]]] = [None] * n_rows
+    ok_dc = np.zeros(n_rows, dtype=bool)
+    dc_va = np.zeros((n_rows, n_buses))
+    dc_pf = np.zeros((n_rows, nl))
+    dc_pg = np.zeros((n_rows, n_gens))
+    t_dc = float("nan")
     if include_dc:
         t0 = time.perf_counter()
         slack_dc = _slack_shares(ls_net, base, v_init, True, max_iter, tol)
         v_dc, ok_dc = _solve_dc_sweeps(ls_net, masks, v_init, max_iter, tol)
         t_dc = (time.perf_counter() - t0) / n_rows
         rows_dc = np.flatnonzero(ok_dc)
-        # lightsim2grid's DC model: flow = (theta_f - theta_t - shift) / (x * tap). Computed
-        # from the angles, since the sweep's own flows leave out the phase shifts.
-        theta = np.angle(v_dc[rows_dc])
-        tap = np.where(base.branches[:, TAP] == 0, 1.0, base.branches[:, TAP])
-        shift = np.deg2rad(base.branches[:, SHIFT])
-        pf = (theta[:, f_row] - theta[:, t_row] - shift) / (
-            base.branches[:, BR_X] * tap
-        )
-        pf = pf * stat[rows_dc]
-        p_out = np.zeros((rows_dc.size, n_buses))
-        np.add.at(p_out.T, f_row, pf.T)
-        np.add.at(p_out.T, t_row, -pf.T)
-        s_gen_dc = (p_out + s_load.real) + 0j
-        gens_dc = _gen_results(
-            base, gen_on[rows_dc], s_gen_dc, slack_dc, bus_row, with_q=False
-        )
-        angle = theta
-        for k, r in enumerate(rows_dc):
-            bus_vmva = np.empty((n_buses, 2))
-            bus_vmva[bus_idx] = np.column_stack((np.abs(v_dc[rows_dc][k]), angle[k]))
-            flows = np.column_stack((pf[k], np.zeros(nl), -pf[k], np.zeros(nl)))
-            res_dc[r] = {
-                "solution": {
-                    "baseMVA": base_mva,
-                    "per_unit": True,
-                    "pf": True,
-                    "arrays": (flows[br_on[r]], gens_dc[k][gen_on[r]], bus_vmva),
-                },
-                "solve_time": t_dc,
-            }
-    return res_ac, res_dc
+        if rows_dc.size:
+            # lightsim2grid's DC model: flow = (theta_f - theta_t - shift) / (x * tap). Computed
+            # from the angles, since the sweep's own flows leave out the phase shifts.
+            theta = np.angle(v_dc[rows_dc])
+            tap = np.where(base.branches[:, TAP] == 0, 1.0, base.branches[:, TAP])
+            shift = np.deg2rad(base.branches[:, SHIFT])
+            pf = (theta[:, f_row] - theta[:, t_row] - shift) / (
+                base.branches[:, BR_X] * tap
+            )
+            pf = pf * stat[rows_dc]
+            p_out = np.zeros((rows_dc.size, n_buses))
+            np.add.at(p_out.T, f_row, pf.T)
+            np.add.at(p_out.T, t_row, -pf.T)  # the other side: minus the flow
+            gens_dc = _gen_results(
+                base,
+                gen_on[rows_dc],
+                (p_out + s_load.real) + 0j,
+                slack_dc,
+                bus_row,
+                with_q=False,
+            )
+            dc_pf[rows_dc] = pf
+            dc_pg[rows_dc] = gens_dc[..., 0]
+            dc_va[np.ix_(rows_dc, bus_idx)] = theta
+
+    return BatchSolution(
+        base_mva=base_mva,
+        br_on=br_on,
+        gen_on=gen_on,
+        ok_ac=ok_ac,
+        vm=vm,
+        va=va,
+        flows=flows,
+        gens=gens,
+        ybus=ybus,
+        t_ac=t_ac,
+        ok_dc=ok_dc,
+        dc_va=dc_va,
+        dc_pf=dc_pf,
+        dc_pg=dc_pg,
+        t_dc=t_dc,
+    )
+
+
+def run_ls_pf_batch(
+    converted: ConvertedNetwork,
+    base: Network,
+    perturbations: Sequence[Network],
+    include_dc: bool,
+    max_iter: int = 50,
+    tol: float = 1e-8,
+) -> Tuple[List[Optional[Dict[str, Any]]], List[Optional[Dict[str, Any]]]]:
+    """:func:`solve_ls_pf_batch`, with one ``run_ls_pf(..., as_arrays=True)``-like dict per row.
+
+    Args:
+        converted: The LSGrid of ``base``, in sync with it (see ``update_lightsim2grid``).
+        base: The network of the scenario before its topology perturbations.
+        perturbations: The perturbed networks.
+        include_dc: Also run the DC power flow.
+        max_iter: Maximum number of iterations.
+        tol: Convergence tolerance.
+
+    Returns:
+        The AC and DC results, one entry per perturbation, None where the power flow did
+        not converge (the DC list is all None if ``include_dc`` is False).
+
+    Raises:
+        BatchNotSupported: If the batch cannot be solved reliably.
+    """
+    if len(perturbations) == 0:
+        return [], []
+    return solve_ls_pf_batch(
+        converted,
+        base,
+        perturbations,
+        include_dc,
+        max_iter,
+        tol,
+    ).row_results()

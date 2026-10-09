@@ -27,7 +27,7 @@ from .api import (
     is_lightsim2grid_available,
     lightsim2grid_network,
 )
-from .batch import BatchNotSupported, run_ls_pf_batch
+from .batch import BatchNotSupported, BatchSolution, run_ls_pf_batch, solve_ls_pf_batch
 from .convert import ConvertedNetwork, to_lightsim2grid, update_lightsim2grid
 from .mapping import MappingL2G, build_l2g_maps
 from .preprocess import get_pf_res, run_ls_pf
@@ -72,6 +72,8 @@ __all__ = [
     "check_lightsim2grid_available",
     "run_ls_pf",
     "run_ls_pf_batch",
+    "solve_ls_pf_batch",
+    "BatchSolution",
     "BatchNotSupported",
     "get_pf_res",
 ]
