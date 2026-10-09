@@ -9,6 +9,7 @@ for data generation purposes.
 import os
 import time
 import traceback
+import warnings
 from importlib import resources
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -59,7 +60,7 @@ from gridfm_datakit.utils.idx_bus import (
     VMIN,
 )
 from gridfm_datakit.utils.idx_cost import COST, NCOST
-from gridfm_datakit.utils.idx_gen import GEN_BUS, PMAX, PMIN, QMAX, QMIN, VG
+from gridfm_datakit.utils.idx_gen import GEN_BUS, GEN_STATUS, PMAX, PMIN, QMAX, QMIN, VG
 from gridfm_datakit.utils.random_seed import custom_seed
 from gridfm_datakit.process.solver_output import (
     SolverOutputConfig,
@@ -985,19 +986,23 @@ def pf_post_processing(
     if Y_bus is None:
         Y_bus, _, _ = makeYbus(net.baseMVA, net.buses, net.branches, branch_vecs)
 
-    # Non-zero entries in row-major order, read straight from the CSR storage
-    # (makeYbus already eliminated the explicit zeros).
+    # Non-zero entries in row-major order (no explicit zeros), either as the
+    # (rows, cols, values) of a batched power flow or read straight from the CSR storage.
     # note that Y_bus[i,j] can be != 0 even if a branch from i to j is not in service because there might be other branches connected to the same buses
-    Y_bus = Y_bus.tocsr()
-    Y_bus.sort_indices()
-    Y_coo = Y_bus.tocoo()
+    if isinstance(Y_bus, tuple):
+        y_rows, y_cols, y_values = Y_bus
+    else:
+        Y_bus = Y_bus.tocsr()
+        Y_bus.sort_indices()
+        Y_coo = Y_bus.tocoo()
+        y_rows, y_cols, y_values = Y_coo.row, Y_coo.col, Y_coo.data
 
-    Y_bus = np.zeros((Y_coo.nnz, 5))
+    Y_bus = np.zeros((y_values.shape[0], 5))
     Y_bus[:, 0] = scenario_index
-    Y_bus[:, 1] = Y_coo.row
-    Y_bus[:, 2] = Y_coo.col
-    Y_bus[:, 3] = Y_coo.data.real
-    Y_bus[:, 4] = Y_coo.data.imag
+    Y_bus[:, 1] = y_rows
+    Y_bus[:, 2] = y_cols
+    Y_bus[:, 3] = y_values.real
+    Y_bus[:, 4] = y_values.imag
 
     # ---- runtime data ----
     n_cols = (
@@ -1020,6 +1025,142 @@ def pf_post_processing(
         "Y_bus": Y_bus,
         "runtime": X_runtime,
     }
+
+
+_LS_BATCH_CHECK_TOL = 1e-6
+
+
+def _ls_batch_matches_loop(
+    perturbations: List[Network],
+    res_ac: List[Optional[Dict[str, Any]]],
+    res_dc: List[Optional[Dict[str, Any]]],
+    include_dc_res: bool,
+) -> bool:
+    """Compare a few rows of a batched lightsim2grid result with one power flow each.
+
+    The batched path rebuilds the branch flows, generator outputs and Ybus from the voltages
+    with the conventions of lightsim2grid. This is a guard that they agree for the
+    installed lightsim2grid, on the first row and on the first generator outage.
+
+    Args:
+        perturbations: The perturbed networks of the batch.
+        res_ac: The batched AC results.
+        res_dc: The batched DC results.
+        include_dc_res: Whether DC results were requested.
+
+    Returns:
+        True if the checked rows agree with the one at a time power flow.
+    """
+    base_gens_off = perturbations[0].gens[:, GEN_STATUS] <= 0
+    rows = [0]
+    for k, p in enumerate(perturbations):
+        if np.any((p.gens[:, GEN_STATUS] <= 0) & ~base_gens_off):
+            rows.append(k)
+            break
+
+    def close(a: np.ndarray, b: np.ndarray) -> bool:
+        return a.shape == b.shape and bool(
+            np.allclose(a, b, rtol=0, atol=_LS_BATCH_CHECK_TOL, equal_nan=True),
+        )
+
+    for k in rows:
+        p = perturbations[k]
+        converted = lightsim2grid.to_lightsim2grid(p)
+        for dc in (False, True) if include_dc_res else (False,):
+            batched = (res_dc if dc else res_ac)[k]
+            try:
+                single = lightsim2grid.run_ls_pf(
+                    converted.ls_net,
+                    p,
+                    converted.mapping_l2g,
+                    dc=dc,
+                    as_arrays=True,
+                )
+            except ValueError:
+                single = None
+            if (single is None) != (batched is None):
+                return False
+            if single is None:
+                continue
+            a, b = single["solution"]["arrays"], batched["solution"]["arrays"]
+            if dc:  # the DC results use the active power flows, the generator active power and the angles
+                if not (
+                    close(a[0][:, [0, 2]], b[0][:, [0, 2]])
+                    and close(a[1][:, 0], b[1][:, 0])
+                    and close(a[2][:, 1], b[2][:, 1])
+                ):
+                    return False
+            else:
+                y_single = single["solution"]["Ybus"].tocoo()
+                y_rows, y_cols, y_values = batched["solution"]["Ybus"]
+                if not (
+                    all(close(x, y) for x, y in zip(a, b))
+                    and np.array_equal(y_single.row, y_rows)
+                    and np.array_equal(y_single.col, y_cols)
+                    and close(y_single.data, y_values)
+                ):
+                    return False
+    return True
+
+
+def _solve_lightsim2grid_batch(
+    net_pf: Network,
+    perturbations: List[Network],
+    include_dc_res: bool,
+    meta: Optional[Dict],
+) -> Tuple[
+    Optional[List[Optional[Dict[str, Any]]]],
+    Optional[List[Optional[Dict[str, Any]]]],
+]:
+    """Solve all the perturbations of a scenario with batched lightsim2grid calls.
+
+    Falls back (returns ``None, None``, the caller then solves one perturbation at a
+    time) if the perturbations are not only outages of the scenario's operating point,
+    if lightsim2grid cannot solve them as a batch, or if the batched results did not
+    pass the check against the one at a time power flow (done once per worker).
+
+    Args:
+        net_pf: The network of the scenario, before its topology perturbations.
+        perturbations: The perturbed networks.
+        include_dc_res: Whether to also run the DC power flow.
+        meta: Per worker state; ``ls_converted`` keeps the LSGrid and ``ls_batch`` the
+            outcome of the check (None: not checked yet, False: disabled).
+
+    Returns:
+        The AC and DC results, one entry per perturbation (None for a power flow that
+        did not converge), or ``None, None``.
+    """
+    state = meta if meta is not None else {}
+    if state.get("ls_batch") is False or len(perturbations) == 0:
+        return None, None
+    try:
+        converted = lightsim2grid.update_lightsim2grid(
+            net_pf, state.get("ls_converted")
+        )
+        state["ls_converted"] = converted
+        res_ac, res_dc = lightsim2grid.run_ls_pf_batch(
+            converted,
+            net_pf,
+            perturbations,
+            include_dc_res,
+        )
+    except lightsim2grid.BatchNotSupported:
+        return None, None
+    except Exception as e:  # never lose a scenario to the batched path
+        warnings.warn(
+            f"Batched lightsim2grid power flow disabled, falling back to one power flow at a time: {e}",
+        )
+        state["ls_batch"] = False
+        return None, None
+    if state.get("ls_batch") is None:
+        if not _ls_batch_matches_loop(perturbations, res_ac, res_dc, include_dc_res):
+            warnings.warn(
+                "Batched lightsim2grid power flow disabled: it does not match the one at a time power flow.",
+            )
+            state["ls_batch"] = False
+            return None, None
+        state["ls_batch"] = True
+    return res_ac, res_dc
 
 
 def process_scenario_pf_mode(
@@ -1143,8 +1284,18 @@ def process_scenario_pf_mode(
         base_variant_id = pp_net.get_working_variant_id()
         lf_params = powsybl.get_default_lf_params()
 
+    batch_ac = batch_dc = None
     if pf_solver == "lightsim2grid":
         lightsim2grid.check_lightsim2grid_available()
+        # all the perturbations of the scenario derive from the same operating point
+        # and are solved together, rather than one at a time
+        perturbations = list(perturbations)
+        batch_ac, batch_dc = _solve_lightsim2grid_batch(
+            net_pf,
+            perturbations,
+            include_dc_res,
+            meta,
+        )
 
     # to get PF points that can violate some OPF inequality constraints (to train PF solvers that can handle points outside of normal operating limits), we apply the topology perturbation after OPF.
     # The setpoints are then no longer adapted to the new topology, and might lead to e.g. abranch overload or a voltage magnitude violation once we drop an element.
@@ -1169,7 +1320,21 @@ def process_scenario_pf_mode(
                     )
                 continue
 
-        if pf_solver == "lightsim2grid":
+        if pf_solver == "lightsim2grid" and batch_ac is not None:
+            res, res_dcpf = batch_ac[pert_index], batch_dc[pert_index]
+            if include_dc_res and res_dcpf is None:
+                with open(error_log_file, "a") as f:
+                    f.write(
+                        f"Caught an exception at scenario {scenario_index} when solving dcpf function with lightsim2grid solver: Power flow computation failed: lightsim2grid did not converge\n",
+                    )
+            if res is None:
+                with open(error_log_file, "a") as f:
+                    f.write(
+                        f"Caught an exception at scenario {scenario_index} when solving in run_pf function with lightsim2grid solver: Power flow computation failed: lightsim2grid did not converge\n",
+                    )
+                continue
+
+        elif pf_solver == "lightsim2grid":
             try:
                 # kept in meta so the same LSGrid is updated in place across the
                 # perturbations (and scenarios) handled by this worker
