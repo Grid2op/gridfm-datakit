@@ -8,6 +8,7 @@ import pytest
 from matpowercaseframes import CaseFrames
 
 from gridfm_datakit import lightsim2grid as l2g
+from gridfm_datakit.lightsim2grid import batch
 from gridfm_datakit.network import Network
 from gridfm_datakit.perturbations.topology_perturbation import (
     NMinusKGenerator,
@@ -22,6 +23,20 @@ pytestmark = pytest.mark.skipif(
 
 _GRID = Path(__file__).parents[1] / "powsybl" / "grids" / "ieee14.m"
 _TOL = 1e-8
+
+
+@pytest.fixture(autouse=True, params=["numpy", "native", "native_numpy_ybus"])
+def outputs(request, monkeypatch):
+    """Run every test with the results rebuilt in numpy, with the ones the sweep returns, and
+    with those but the Ybus of each row rebuilt from the base Ybus."""
+    native = request.param != "numpy"
+    if native and not batch.native_outputs_available():
+        pytest.skip(
+            "this lightsim2grid does not return per-row results (needs >= 1.2.0)",
+        )
+    monkeypatch.setattr(batch, "_USE_NATIVE_OUTPUTS", native)
+    monkeypatch.setattr(batch, "_USE_NATIVE_YBUS", request.param != "native_numpy_ybus")
+    return request.param
 
 
 def _load_net() -> Network:

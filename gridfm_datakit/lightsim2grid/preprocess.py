@@ -65,6 +65,34 @@ def run_ls_pf(
     )
 
 
+def convert_ybus(ybus: Any, net: Network) -> csr_matrix:
+    """Re-index a lightsim2grid Ybus like :func:`gridfm_datakit.network.makeYbus`.
+
+    Args:
+        ybus: A sparse matrix with one row per lightsim2grid bus (= per row of
+            ``net.buses``), e.g. ``LSGrid.get_Ybus()`` or ``ScenarioSweepCPP.get_Ybus(row)``.
+        net: The network the LSGrid is in sync with.
+
+    Returns:
+        The sparse Ybus (no explicit zeros, sorted indices), with row and column ``i`` for
+        the bus whose ``BUS_I`` is ``i``.
+    """
+    bus_i = net.buses[:, BUS_I].astype(int)
+    n_buses = net.buses.shape[0]
+    if np.array_equal(bus_i, np.arange(n_buses)):
+        ybus = ybus.tocsr()
+    else:
+        ybus = ybus.tocoo()
+        ybus = csr_matrix(
+            (ybus.data, (bus_i[ybus.row], bus_i[ybus.col])),
+            shape=(n_buses, n_buses),
+        )
+        ybus.sum_duplicates()
+    ybus.sort_indices()
+    ybus.eliminate_zeros()
+    return ybus
+
+
 def get_ybus(ls_net: Any, net: Network) -> csr_matrix:
     """Bus admittance matrix of the LSGrid, indexed like :func:`gridfm_datakit.network.makeYbus`.
 
@@ -82,21 +110,7 @@ def get_ybus(ls_net: Any, net: Network) -> csr_matrix:
         ``makeYbus(net.baseMVA, net.buses, net.branches)`` up to the rounding of the
         summation order.
     """
-    ybus = ls_net.get_Ybus()  # one row per lightsim2grid bus = per row of net.buses
-    bus_i = net.buses[:, BUS_I].astype(int)
-    n_buses = net.buses.shape[0]
-    if np.array_equal(bus_i, np.arange(n_buses)):
-        ybus = ybus.tocsr()
-    else:
-        ybus = ybus.tocoo()
-        ybus = csr_matrix(
-            (ybus.data, (bus_i[ybus.row], bus_i[ybus.col])),
-            shape=(n_buses, n_buses),
-        )
-        ybus.sum_duplicates()
-    ybus.sort_indices()
-    ybus.eliminate_zeros()
-    return ybus
+    return convert_ybus(ls_net.get_Ybus(), net)
 
 
 def get_pf_res(

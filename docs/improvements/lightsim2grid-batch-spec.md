@@ -251,6 +251,44 @@ outages, and for the vectorised post-processing. Once F1–F5 exist, its numpy r
 
 ---
 
+## 9. Status in lightsim2grid 1.2.0 (checked)
+
+Each item re-checked on the 1.2.0 wheel with the reproducers of appendix A and the datakit's tests.
+
+| item | 1.2.0 | note |
+|---|---|---|
+| B1 DC generator-only row after a line row | **fixed** | repro: 0 deg (was 0.395 deg); both row orders exact |
+| B2 DC sweep flows ignore phase shifters | **fixed** | repro: 0 of 4 582 branches differ (max 1e-13 MW; was 12, up to 73 MW) |
+| F1 branch flows, both ends | **done** | `compute_branch_results()`: `(rows, lines then trafos, [P1, Q1, P2, Q2])` in MW/MVAr, zero for open branches; equals `get_line_res*` / `get_trafo_res*` to 5e-10 |
+| F2 generator P and Q | **done** | `compute_gen_results = True`, `get_gen_results()`; equals `get_gen_res` to 1e-9, slack of the slack bus and removed generators included |
+| F3 per-row Ybus | **done, but slow** | `get_Ybus(row)`: right pattern, **0.55 ms/row on 2 869 buses (about 15 % of the 3.7 ms an AC row costs)** — rebuilding it from the base Ybus in numpy takes 0.14 ms/row. A cheaper accessor is the one remaining ask (see below) |
+| F4 DC through the same API | **done** | same accessors; `get_dcYbus(row)` |
+| F5 slack share per generator | **done** | `LSGrid.get_gen_slack_shares()` |
+| F6 slack weights follow `change_p_gen` | **documented, unchanged** | the docstring now says `change_p_gen` does not update them; the repro still gives 0.333 / 0.333 / 0.333 |
+| F7 KLU by default | **done** | `init_from_matpower` grids start on `NR_KLU` / `DC_KLU` |
+| F8 cheaper single call after a topology change | **not changed** | 2 869 buses, one line opened: AC 7.8 ms (8.6 ms on 1.1.0), DC 2.5 ms (2.4 ms) |
+| F11 per-row time and iterations | **done** | `get_row_solve_times()`, `get_row_nb_iter()` |
+| F9, F10 | not re-checked | |
+
+**What it is worth to the datakit** (batch of 20 rows, DC on, best of 25, `solve_ls_pf_batch` alone):
+
+| buses | numpy rebuild | native outputs, `get_Ybus(row)` | native outputs, Ybus from base in numpy |
+|---|---|---|---|
+| 118 | 0.28 ms/row | 0.31 | 0.24 |
+| 793 | 1.31 | 1.35 | 1.15 |
+| 1 354 | 2.54 | 2.48 | 2.25 |
+| 2 383 | 4.25 | 4.23 | 3.83 |
+| 2 869 | 5.62 | 5.53 | 5.15 |
+
+The native results replace ~250 lines of numpy and the conventions they had to guess, remove the base-case
+solves and the DC workaround, but they are **not faster by themselves**: reading the results out costs about what
+the numpy rebuild did. The saving appears (8 – 15 % of the batch solve, about 5 % of the whole inner loop) only
+if the Ybus is not read per row with `get_Ybus(row)`.
+
+**Remaining asks:** a per-row Ybus that is as cheap as the numpy delta, e.g. the data array of the base pattern
+for every row at once (`(rows, nnz)` plus the shared `indptr`/`indices`, and a mask of the entries that vanish),
+and reading it in grid bus order without a sparse-matrix object per row.
+
 ## Appendix A — reproducers
 
 Files used: `pglib_opf_case118_ieee.m`, `pglib_opf_case793_goc.m`, `pglib_opf_case2869_pegase.m` from

@@ -33,7 +33,7 @@ from gridfm_datakit.utils.idx_bus import BS, BUS_I, BUS_TYPE, GS, PD, QD, REF
 from gridfm_datakit.utils.idx_gen import GEN_BUS, GEN_STATUS, PG, QMAX, QMIN
 
 from .convert import ConvertedNetwork, initial_voltage
-from .preprocess import get_ybus
+from .preprocess import convert_ybus, get_ybus
 
 
 class BatchNotSupported(Exception):
@@ -146,9 +146,12 @@ def _solve_sweep(
     algorithms: Sequence[str],
     max_iter: int,
     tol: float,
+    gen_results: bool = False,
 ) -> Tuple[Any, np.ndarray, np.ndarray]:
     line_mask, trafo_mask, gen_mask = masks
     sweep = _make_sweep(ls_net, algorithms)
+    if gen_results:
+        sweep.compute_gen_results = True  # lightsim2grid >= 1.2.0
     try:
         if line_mask.shape[1]:
             sweep.set_contingency_lines(line_mask)
@@ -364,13 +367,13 @@ class BatchSolution:
         flows: ``(rows, n_branches, 4)`` AC ``pf, qf, pt, qt``.
         gens: ``(rows, n_gens, 2)`` AC ``pg, qg``.
         ybus: per row ``(rows, cols, values)`` of the Ybus non-zeros in row-major order.
-        t_ac: AC solving time per row.
+        t_ac: ``(rows,)`` AC solving time of each row.
         ok_dc: ``(rows,)`` the DC power flow converged (all False without DC).
         dc_va: ``(rows, n_buses)`` DC voltage angle.
         dc_pf: ``(rows, n_branches)`` DC active power at the origin side (the other side is
             ``-dc_pf``).
         dc_pg: ``(rows, n_gens)`` DC generator active power.
-        t_dc: DC solving time per row.
+        t_dc: ``(rows,)`` DC solving time of each row (NaN without DC).
     """
 
     base_mva: float
@@ -382,12 +385,12 @@ class BatchSolution:
     flows: np.ndarray
     gens: np.ndarray
     ybus: List[Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]]
-    t_ac: float
+    t_ac: np.ndarray
     ok_dc: np.ndarray
     dc_va: np.ndarray
     dc_pf: np.ndarray
     dc_pg: np.ndarray
-    t_dc: float
+    t_dc: np.ndarray
 
     def row_result(self, r: int) -> Tuple[Optional[Dict], Optional[Dict]]:
         """AC and DC results of one row as ``run_ls_pf(..., as_arrays=True)``-like dicts.
@@ -412,7 +415,7 @@ class BatchSolution:
                     ),
                     "Ybus": self.ybus[r],
                 },
-                "solve_time": self.t_ac,
+                "solve_time": float(self.t_ac[r]),
             }
         if self.ok_dc[r]:
             zeros = np.zeros(self.dc_pf.shape[1])
@@ -431,7 +434,7 @@ class BatchSolution:
                         np.column_stack((np.ones_like(self.dc_va[r]), self.dc_va[r])),
                     ),
                 },
-                "solve_time": self.t_dc,
+                "solve_time": float(self.t_dc[r]),
             }
         return res_ac, res_dc
 
@@ -445,6 +448,149 @@ class BatchSolution:
         """
         pairs = [self.row_result(r) for r in range(self.br_on.shape[0])]
         return [a for a, _ in pairs], [d for _, d in pairs]
+
+
+# Whether the sweep returns the branch flows, generator outputs and Ybus of every row itself
+# (lightsim2grid >= 1.2.0). None: use them when the installed lightsim2grid has them.
+_USE_NATIVE_OUTPUTS: Optional[bool] = None
+# With them, whether the Ybus of every row is read from the sweep (``get_Ybus(row)``) or
+# rebuilt from the base Ybus minus the open branches (``_ybus_removal``).
+_USE_NATIVE_YBUS: bool = True
+
+
+def native_outputs_available() -> bool:
+    """Whether the installed lightsim2grid returns per-row branch, generator and Ybus results."""
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+
+    return hasattr(ScenarioSweepCPP, "compute_branch_results") and hasattr(
+        ScenarioSweepCPP, "get_gen_results"
+    )
+
+
+def _ybus_entries(ybus: Any, net: Network) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(rows, cols, values)`` of the non-zeros of a lightsim2grid Ybus, in row-major order."""
+    y = convert_ybus(ybus, net)
+    return np.repeat(np.arange(y.shape[0]), np.diff(y.indptr)), y.indices, y.data
+
+
+def _solve_native(
+    ls_net: Any,
+    mapping: Any,
+    base: Network,
+    masks: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    br_on: np.ndarray,
+    gen_on: np.ndarray,
+    include_dc: bool,
+    max_iter: int,
+    tol: float,
+) -> "BatchSolution":
+    """:func:`solve_ls_pf_batch` with the results the sweep computes itself (lightsim2grid >= 1.2.0).
+
+    The branch flows at both ends, the generator outputs (with lightsim2grid's slack and
+    reactive power rules), the per-row Ybus and the per-row solving times are read from
+    the sweep, so nothing is rebuilt in numpy and no base case power flow is needed.
+
+    Args:
+        ls_net: The LSGrid of ``base``, in sync with it.
+        mapping: Index maps between ``base`` and ``ls_net``.
+        base: The network of the scenario before its topology perturbations.
+        masks: Line, trafo and generator outage masks, one row per perturbation.
+        br_on: ``(rows, n_branches)`` which branches are in service.
+        gen_on: ``(rows, n_gens)`` which generators are in service.
+        include_dc: Also run the DC power flow.
+        max_iter: Maximum number of iterations.
+        tol: Convergence tolerance.
+
+    Returns:
+        The stacked results.
+    """
+    n_rows = br_on.shape[0]
+    base_mva = float(base.baseMVA)
+    n_buses, nl = base.buses.shape[0], base.branches.shape[0]
+    n_gens = base.gens.shape[0]
+    bus_idx = base.buses[:, BUS_I].astype(int)
+    n_lines = len(mapping.line_rows)
+    v_init = initial_voltage(base)
+
+    def read_results(sweep: Any) -> Tuple[np.ndarray, np.ndarray]:
+        # (rows, lines then trafos, [P1, Q1, P2, Q2]) in MW / MVAr -> pu, in branch order
+        raw = np.asarray(sweep.compute_branch_results()) / base_mva
+        flows = np.zeros((n_rows, nl, 4))
+        flows[:, mapping.line_rows] = raw[:, :n_lines]
+        flows[:, mapping.trafo_rows] = raw[:, n_lines:]
+        return flows, np.asarray(sweep.get_gen_results()) / base_mva
+
+    sweep, v_ac, ok_ac = _solve_sweep(
+        ls_net,
+        masks,
+        v_init,
+        ("NR_KLU", "NR_SparseLU"),
+        max_iter,
+        tol,
+        gen_results=True,
+    )
+    flows, gens = read_results(sweep)
+    rows = np.flatnonzero(ok_ac)
+    vm = np.zeros((n_rows, n_buses))
+    va = np.zeros((n_rows, n_buses))
+    vm[np.ix_(rows, bus_idx)] = np.abs(v_ac[rows])
+    va[np.ix_(rows, bus_idx)] = np.angle(v_ac[rows])
+    ybus: List[Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = [None] * n_rows
+    if _USE_NATIVE_YBUS:
+        for r in rows:
+            ybus[r] = _ybus_entries(sweep.get_Ybus(int(r)), base)
+    elif rows.size:
+        # the base Ybus minus the branches each row opens
+        ls_net.ac_pf(v_init, max_iter, tol)
+        Ytt, Yff, Yft, Ytf = branch_vectors(base.branches, nl)
+        base_br_on = base.branches[:, BR_STATUS] > 0
+        removed = [np.flatnonzero(~br_on[r] & base_br_on) for r in rows]
+        for r, y in zip(
+            rows,
+            _ybus_removal(get_ybus(ls_net, base), base, (Ytt, Yff, Yft, Ytf), removed),
+        ):
+            ybus[r] = y
+    t_ac = np.asarray(sweep.get_row_solve_times(), dtype=float)
+
+    ok_dc = np.zeros(n_rows, dtype=bool)
+    dc_va = np.zeros((n_rows, n_buses))
+    dc_pf = np.zeros((n_rows, nl))
+    dc_pg = np.zeros((n_rows, n_gens))
+    t_dc = np.full(n_rows, np.nan)
+    if include_dc:
+        sweep_dc, v_dc, ok_dc = _solve_sweep(
+            ls_net,
+            masks,
+            v_init,
+            ("DC_KLU", "DC_SparseLU"),
+            max_iter,
+            tol,
+            gen_results=True,
+        )
+        flows_dc, gens_dc = read_results(sweep_dc)
+        rows_dc = np.flatnonzero(ok_dc)
+        dc_pf[:] = flows_dc[..., 0]  # the other side is the opposite
+        dc_pg[:] = gens_dc[..., 0]
+        dc_va[np.ix_(rows_dc, bus_idx)] = np.angle(v_dc[rows_dc])
+        t_dc = np.asarray(sweep_dc.get_row_solve_times(), dtype=float)
+
+    return BatchSolution(
+        base_mva=base_mva,
+        br_on=br_on,
+        gen_on=gen_on,
+        ok_ac=ok_ac,
+        vm=vm,
+        va=va,
+        flows=flows,
+        gens=gens,
+        ybus=ybus,
+        t_ac=t_ac,
+        ok_dc=ok_dc,
+        dc_va=dc_va,
+        dc_pf=dc_pf,
+        dc_pg=dc_pg,
+        t_dc=t_dc,
+    )
 
 
 def solve_ls_pf_batch(
@@ -493,6 +639,16 @@ def solve_ls_pf_batch(
         ~gen_on & base_gen_on,
     )
 
+    use_native = (
+        native_outputs_available()
+        if _USE_NATIVE_OUTPUTS is None
+        else _USE_NATIVE_OUTPUTS
+    )
+    if use_native:
+        return _solve_native(
+            ls_net, mapping, base, masks, br_on, gen_on, include_dc, max_iter, tol
+        )
+
     v_init = initial_voltage(base)
     t0 = time.perf_counter()
     slack_share = _slack_shares(ls_net, base, v_init, False, max_iter, tol)
@@ -505,7 +661,7 @@ def solve_ls_pf_batch(
         max_iter,
         tol,
     )
-    t_ac = (time.perf_counter() - t0) / n_rows
+    t_ac = np.full(n_rows, (time.perf_counter() - t0) / n_rows)
 
     # branch quantities (pu), per perturbation
     Ytt, Yff, Yft, Ytf = branch_vectors(base.branches, nl)
@@ -552,12 +708,12 @@ def solve_ls_pf_batch(
     dc_va = np.zeros((n_rows, n_buses))
     dc_pf = np.zeros((n_rows, nl))
     dc_pg = np.zeros((n_rows, n_gens))
-    t_dc = float("nan")
+    t_dc = np.full(n_rows, np.nan)
     if include_dc:
         t0 = time.perf_counter()
         slack_dc = _slack_shares(ls_net, base, v_init, True, max_iter, tol)
         v_dc, ok_dc = _solve_dc_sweeps(ls_net, masks, v_init, max_iter, tol)
-        t_dc = (time.perf_counter() - t0) / n_rows
+        t_dc = np.full(n_rows, (time.perf_counter() - t0) / n_rows)
         rows_dc = np.flatnonzero(ok_dc)
         if rows_dc.size:
             # lightsim2grid's DC model: flow = (theta_f - theta_t - shift) / (x * tap). Computed

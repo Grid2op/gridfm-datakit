@@ -1157,9 +1157,9 @@ def pf_post_processing_batch(
         Y_bus[:, 3] = y_values.real
         Y_bus[:, 4] = y_values.imag
         X_runtime = runtime.copy()
-        X_runtime[0, 1] = sol.t_ac
+        X_runtime[0, 1] = sol.t_ac[r]
         if include_dc_res:
-            X_runtime[0, 2] = sol.t_dc if sol.ok_dc[r] else np.nan
+            X_runtime[0, 2] = sol.t_dc[r] if sol.ok_dc[r] else np.nan
         out[r] = (X_bus[k], X_gen[k], X_branch[k], Y_bus, X_runtime)
     return out
 
